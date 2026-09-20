@@ -27,6 +27,46 @@ npm run dev:all
 
 Open the dashboard at **http://localhost:5173**. The API binds to **127.0.0.1:3001**. No `.env` is necessary. Setting `EXECUTION_MODE` to anything other than `PAPER` aborts application startup. Scenario runs start from the same initial ledger; they are not successive trades on a persistent account.
 
+## Dashboard views
+
+Captured from the running local app with synthetic fixtures. Expand a view below; reproduce it with `npm run dev:all` and the scenario selector.
+
+<details>
+<summary>Normal replay — ledger and risk</summary>
+
+One costed paper fill changes cash and holdings. Concentration falls while this fixture's historical VaR rises; both are visible rather than summarized as a universal risk improvement.
+
+![Normal paper replay showing before-and-after cash, holdings, concentration and historical risk](docs/images/dashboard-ledger-risk.png)
+
+</details>
+
+<details>
+<summary>Execution failure — approval is not a fill</summary>
+
+In `execution-failure`, consensus and constraints approve, but the broker refuses the fill. Cash and units remain unchanged. Reconciliation PASS confirms that accounting, not successful execution.
+
+![Approved consensus and constraints beside failed paper execution, no fill and zero cash movement](docs/images/dashboard-execution-failure.png)
+
+</details>
+
+<details>
+<summary>Missing data — UNKNOWN, not zero risk</summary>
+
+In `missing-price`, execution is blocked. NAV and risk remain UNKNOWN; known cash and unit balances are preserved.
+
+![Missing-price scenario showing unknown portfolio valuations and risk metrics with unchanged balances](docs/images/dashboard-missing-data.png)
+
+</details>
+
+<details>
+<summary>Mobile layout — the same replay on a narrow screen</summary>
+
+Scenario controls, final outcome and pipeline stages adapt to a 390-pixel-wide viewport. This is the responsive web dashboard, not a separate mobile app.
+
+<img src="docs/images/dashboard-mobile.png" alt="Mobile dashboard showing the normal paper replay, scenario selector and seven pipeline stages" width="320" />
+
+</details>
+
 ## The supported pipeline
 
 ```text
