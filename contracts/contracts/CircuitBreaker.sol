@@ -19,6 +19,10 @@ contract CircuitBreaker is Ownable {
     }
 
     function setPaused(bool _paused) external onlyOwner {
+        _setPaused(_paused);
+    }
+
+    function _setPaused(bool _paused) internal {
         paused = _paused;
         emit Paused(_paused);
     }

@@ -45,6 +45,14 @@ export async function observeOnchain(): Promise<{ data: DataPoint[]; positions: 
   const tReId = symbolToId.get("tRE");
   const tBillPrice = tBillId ? pricesById[tBillId] : undefined;
   const tRePrice = tReId ? pricesById[tReId] : undefined;
+  if (typeof tBillPrice !== "number" || !Number.isFinite(tBillPrice) || tBillPrice <= 0 ||
+      typeof tRePrice !== "number" || !Number.isFinite(tRePrice) || tRePrice <= 0) {
+    throw new Error("Market data unavailable: both tBILL and tRE require a valid positive price");
+  }
+  if (![CONFIG.positionQtyTbill, CONFIG.positionQtyTre].every(q => Number.isFinite(q) && q >= 0) ||
+      !Number.isFinite(tBillPrice * CONFIG.positionQtyTbill) || !Number.isFinite(tRePrice * CONFIG.positionQtyTre)) {
+    throw new Error("Invalid demo position sizing");
+  }
 
   data.push(
     {
@@ -68,8 +76,8 @@ export async function observeOnchain(): Promise<{ data: DataPoint[]; positions: 
       assetId: "0xTokenizedTBill",
       symbol: "tBILL",
       quantity: String(CONFIG.positionQtyTbill),
-      price: Number.isFinite(tBillPrice) ? String(tBillPrice) : "0",
-      value: Number.isFinite(tBillPrice) ? String(tBillPrice * CONFIG.positionQtyTbill) : "0",
+      price: String(tBillPrice),
+      value: String(tBillPrice * CONFIG.positionQtyTbill),
       tags: ["rwa", "treasury"],
       chainId: CONFIG.chainId,
     },
@@ -77,8 +85,8 @@ export async function observeOnchain(): Promise<{ data: DataPoint[]; positions: 
       assetId: "0xTokenizedRE",
       symbol: "tRE",
       quantity: String(CONFIG.positionQtyTre),
-      price: Number.isFinite(tRePrice) ? String(tRePrice) : "0",
-      value: Number.isFinite(tRePrice) ? String(tRePrice * CONFIG.positionQtyTre) : "0",
+      price: String(tRePrice),
+      value: String(tRePrice * CONFIG.positionQtyTre),
       tags: ["rwa", "real-estate"],
       chainId: CONFIG.chainId,
     },
@@ -88,21 +96,18 @@ export async function observeOnchain(): Promise<{ data: DataPoint[]; positions: 
 }
 
 async function fetchCoingeckoPrices(ids: string[], vs: string): Promise<Record<string, number>> {
-  if (!ids.length) return {};
-  try {
-    const url = new URL(CONFIG.coingeckoBaseUrl);
-    url.searchParams.set("ids", ids.join(","));
-    url.searchParams.set("vs_currencies", vs);
-    const res = await fetch(url.toString(), { method: "GET" });
-    if (!res.ok) return {};
-    const json: any = await res.json();
-    const out: Record<string, number> = {};
-    for (const id of ids) {
-      const price = Number(json?.[id]?.[vs]);
-      if (Number.isFinite(price)) out[id] = price;
-    }
-    return out;
-  } catch {
-    return {};
+  if (!ids.length) throw new Error("Market data unavailable: configure CoinGecko asset IDs");
+  const url = new URL(CONFIG.coingeckoBaseUrl);
+  url.searchParams.set("ids", ids.join(","));
+  url.searchParams.set("vs_currencies", vs);
+  const res = await fetch(url.toString(), { method: "GET", signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new Error(`Market price request failed: HTTP ${res.status}`);
+  const json: any = await res.json();
+  const out: Record<string, number> = {};
+  for (const id of ids) {
+    const price = json?.[id]?.[vs];
+    if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) throw new Error(`Market data unavailable: invalid price for ${id}`);
+    out[id] = price;
   }
+  return out;
 }

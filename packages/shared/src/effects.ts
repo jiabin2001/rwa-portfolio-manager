@@ -48,9 +48,13 @@ export const Effect = {
         reject(new Error("Cancelled"));
         return;
       }
-      const id = setTimeout(() => resolve(), ms);
+      const id = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
       const onAbort = () => {
         clearTimeout(id);
+        signal.removeEventListener("abort", onAbort);
         reject(new Error("Cancelled"));
       };
       signal.addEventListener("abort", onAbort, { once: true });
@@ -98,7 +102,10 @@ export function createHttpClient(): HttpClient {
     async getJson<A>(url: string, init?: RequestInit): Promise<A> {
       const response = await fetch(url, {
         cache: "no-store",
-        ...init
+        ...init,
+        signal: init?.signal
+          ? AbortSignal.any([init.signal, AbortSignal.timeout(10_000)])
+          : AbortSignal.timeout(10_000)
       });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);

@@ -3,18 +3,19 @@ import { observeOnchain } from "./onchainObserver.js";
 import { observeFdc } from "../fdc/fdcAdapter.js";
 import type { DataPoint, PortfolioPosition } from "@rpm/shared";
 
-function extractNavUsd(data: DataPoint[], key: string): number | null {
+export function extractNavUsd(data: DataPoint[], key: string): number | null {
   const point = data.find((d) => d.key === key);
   if (!point) return null;
   const value = point.value as any;
-  if (value && typeof value.nav === "number") return value.nav;
-  if (value && typeof value.nav_usd_e6 === "number") return value.nav_usd_e6 / 1_000_000;
-  const parsed = Number(value?.nav ?? value?.nav_usd_e6);
-  return Number.isFinite(parsed) ? parsed : null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value.nav ?? value.nav_usd_e6;
+  if (typeof raw !== "number" && !(typeof raw === "string" && /^[0-9]+(?:\.[0-9]+)?$/.test(raw))) return null;
+  const parsed = Number(raw) / (value.nav != null ? 1 : 1_000_000);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 function applyNavToPositions(positions: PortfolioPosition[], navUsd: number | null): PortfolioPosition[] {
-  if (navUsd == null || !Number.isFinite(navUsd)) return positions;
+  if (navUsd == null || !Number.isFinite(navUsd) || navUsd <= 0) return positions;
   return positions.map((p) => {
     if (p.symbol !== "tBILL") return p;
     const qty = Number(p.quantity);

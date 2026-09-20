@@ -1,15 +1,29 @@
 {
   "name": "rwa-portfolio-manager",
   "private": true,
+  "engines": { "node": ">=24 <25", "npm": ">=11 <12" },
+  "packageManager": "npm@11.6.2",
+  "devDependencies": { "prettier": "3.9.8" },
   "workspaces": [
     "apps/*",
     "packages/*",
     "contracts"
   ],
   "scripts": {
-    "lint": "echo \"(optional) add eslint\"",
+    "build:shared": "npm -w packages/shared run build",
+    "build": "npm run build:shared && npm -w apps/middleware run build && npm -w apps/dashboard run build && npm -w contracts run compile",
+    "typecheck": "npm run build:shared && npm -w apps/middleware run typecheck && npm -w apps/dashboard run typecheck && npm -w contracts run typecheck",
+    "test": "npm run build:shared && tsx --test apps/middleware/tests/*.test.ts && npm -w apps/dashboard test && npm -w contracts test",
+    "format:check": "prettier --check \"apps/middleware/src/paper/**/*.ts\" \"packages/shared/src/paper.ts\" \"apps/middleware/tests/paper*.test.ts\" \"docs/*.md\" README.md .github/workflows/ci.yml",
+    "verify": "npm run format:check && npm run typecheck && npm test && npm run build && npm run demo:all",
+    "demo": "npm run build:shared && tsx apps/middleware/src/paper/cli.ts run",
+    "demo:all": "npm run demo -- --scenario all",
+    "replay": "npm run build:shared && tsx apps/middleware/src/paper/cli.ts replay",
+    "predev": "npm run build:shared",
     "dev": "npm -w apps/middleware run dev",
+    "predev:dashboard": "npm run build:shared",
     "dev:dashboard": "npm -w apps/dashboard run dev",
+    "predev:all": "npm run build:shared",
     "dev:all": "node ./scripts/dev-all.mjs"
   }
 }

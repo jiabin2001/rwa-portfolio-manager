@@ -1,80 +1,59 @@
-# Architecture (MVP)
+# Supported architecture and trust boundaries
 
-## Workflow
-**Data → Verification → Risk Score → Policy Decision → Constrained Execution**
+## Pure core, explicit I/O
 
-1. **Observe**
-   - On-chain: positions, prices (DEX/oracles), portfolio NAV
-   - Off-chain: issuer reports, KYC status, credit events, benchmarks
-   - FDC: attest Web2/Web3 facts (NAV snapshots, index levels, event proofs)
+`apps/middleware/src/paper/engine.ts` has no network, wall clock, random generator or filesystem access. `runPaper(scenario)` produces the entire result from a versioned fixture and policy. The logical event time is the fixture valuation time, not the user's current time. CLI file writes and the HTTP server are separate boundaries; the React dashboard only inspects API output.
 
-2. **Verify**
-   - Data provenance agent tracks source, timestamp, confidence, conflicts
-   - FDC proofs verified on-chain using Merkle root / proofs
+The first audit event binds the dataset hash, policy hash, scenario, quote timestamp, initial ledger and prices. Events use sorted-key JSON encoding, SHA-256 and a previous-hash link. The final event contains the resulting ledger, risk and reconciliation. A run ID hashes the scenario and dataset/policy identities; an action ID additionally binds its terms. No random UUID or fake transaction hash is used in this workflow.
 
-3. **Score risk + explain drivers**
-   - Risk sentinels compute VaR, drawdown, liquidity stress, credit flags
-   - Each specialist agent produces a `Signal` + explanation
+## State transitions
 
-4. **Policy decision**
-   - Orchestrator aggregates signals → `Decision`
-   - Conflict resolution: prioritize hard constraints and compliance veto
-   - Produces recommended actions + optionally parameter updates (soft/dynamic)
+```text
+DATA invalid ────────────────────────────────────────→ BLOCKED
+DATA valid → RISK → no breach ────────────────────────→ NO_ACTION
+                 → PROPOSE → CONSENSUS insufficient ─→ ESCALATED
+                                      denied ───────→ BLOCKED
+                                      approved
+                                        ↓
+                              CONSTRAINTS denied ───→ BLOCKED
+                                          approved
+                                            ↓
+                                  EXECUTION rejected → FAILED
+                                            filled ─→ CONFIRMED
+All published outcomes → RECONCILIATION → AUDIT / REPLAY
+```
 
-5. **Constrained execution**
-   - Execution agent validates intents against constraint engine
-   - Pushes intents into on-chain `TransactionQueue` with approvals
-   - Router executes only pre-approved action types + bounded parameters
-   - Circuit breaker requires human multisig / owner
+All current fixtures require a proposal except data-quality failures; the NO_ACTION branch is supported but is not one of the seven fixed scenarios. Reconciliation must pass before a result is returned. A trade failure is a business outcome, not HTTP success masquerading as a confirmed trade: clients must inspect `run.status`. An unexpected internal invariant failure returns HTTP 500 and retains the previous complete state.
 
-## Rule layers
-- Regulatory layer: investor eligibility, jurisdiction rules, disclosures
-- Risk layer: position limits, concentration, liquidity reserve, drawdown
-- Execution layer: slippage bounds, venue allow-list, gas ceilings
-- Operations layer: authority hierarchy, escalation, fail-safe conditions
+## Accounting and risk
 
-## Hidden relationship discovery
-Model service learns **co-movements** (rolling correlation / regimes) and proposes
-hedges or diversification candidates. Middleware treats these as suggestions,
-not direct execution.
+- Money and prices use integer cents; positions use whole shares. BigInt intermediate multiplication prevents unsafe monetary products; conversion outside JavaScript's safe-integer range fails. Fractional tokens and arbitrary token decimals are intentionally unsupported.
+- Mid-price NAV is cash plus the marked value of holdings. Cash earns no interest.
+- A sell fill uses `floor(midCents × 9990 / 10000)`. Fee is `floor(grossCents × 5 / 10000)`. Cash increases by gross minus fee; shares decrease by the filled quantity.
+- Reconciliation checks cash change against net fills, each holding against filled units, and NAV change against negative fee plus slippage costs. When quotes are untrusted, NAV/risk stay null; only unchanged-ledger reconciliation is available.
+- Historical simulation reprices the same current portfolio across 31 daily closes. Return is consecutive historical NAV ratio minus one. VaR is the nearest-rank 95% quantile of losses, floored at zero. ES is the mean of losses at or above that quantile, also floored at zero. Drawdown uses historical running peak NAV. Ties can include more than 5% of observations in ES.
+- Only concentration drives the sell rule. There is no optimizer, no trained model, and no claim of improved VaR/ES or return. Cash and the post-fill holdings are held constant throughout each risk window.
 
----
+## Execution and persistence
 
-## Architecture updates (Confidence, LLM, Consensus, Reputation, UI)
+The broker rechecks constraints immediately before execution, computes a new ledger, and only then commits the ledger and idempotency record in the same synchronous in-memory operation. Injected execution failure occurs before either mutation. Retrying the identical action/quote pair returns the original fill; changing either under the same key fails.
 
-### 1) Richer agent reports
-- Each `Signal` now includes **confidence**, **riskScore**, **reasons**, **evidence**, and **constraintsTouched**.
-- This makes decisions auditable: “why” (reasons), “how sure” (confidence), and “receipts” (evidence).
+This is **run-scoped** idempotency, not a database transaction, restart recovery, or multi-process exactly-once guarantee. Each scenario resets to the fixture. The API stores only the latest complete run in memory. The CLI is the supported durable evidence exporter; three files are written individually, not as an atomic durable journal. A crash during export may leave incomplete evidence; replay/report comparison rejects incomplete or inconsistent content. Running two exporters into the same directory is unsupported; choose different `--out` paths.
 
-### 2) LLM middleware (optional)
-- A local OpenAI-compatible endpoint can be enabled via `.env`:
-  - `LLM_ENABLED`, `LLM_CHAT_URL`, `LLM_MODEL`.
-- **Compliance** uses the LLM only to rephrase explanations (veto logic remains deterministic).
-- **Analyst** can ask the LLM for 0–2 action proposals in **strict JSON**; invalid output is rejected.
-- If the LLM is down or disabled, the system falls back to the existing rule/model logic.
+## Threat model and limitations
 
-### 3) Output validation (“semantic understanding”)
-- The LLM is treated as a **suggestion generator** only.
-- Outputs must match a rigid JSON schema and a closed action vocabulary.
-- Anything malformed/out-of-vocabulary is dropped; valid items still face constraints and consensus.
+The supported workflow trusts the checked-out source, local fixture, fixed policy, runtime and filesystem. Votes are deterministic local rule outputs, not authenticated messages. The local API has no accounts or authorization and must not be exposed publicly. It binds IPv4 loopback, bounds request size/time, allows only two local dashboard origins, validates the request schema and refuses unknown scenarios. The Vite server is also for local development only.
 
-### 4) Weighted consensus + swarm coordination
-- Orchestrator aggregates signals with **weights** (adjusted by reputation).
-- Actions are **APPROVED / DENIED / ESCALATED** based on support vs oppose weight thresholds.
-- Escalation becomes a first-class outcome when consensus is insufficient.
+Replay first checks the chain, then requires an exact semantic match against a fresh run. Rehashing altered fills or truncating valid prefixes therefore still fails. A different valid scenario is not an invalid run; verify the independently stored expected head via `--head` to bind the intended scenario. The head file beside the log is convenient but **not an independent trust anchor**. This is tamper-evident relative to trusted code/data, not tamper-proof or externally timestamped evidence.
 
-### 5) Risk sentinel: multi-metric scoring
-- Risk score now includes multiple metrics (concentration, liquidity, credit, VaR proxies, drawdown).
-- These metrics are attached to the `Decision` for UI display and auditability.
+Legacy FDC decoding now accepts known NAV fields or the declared ABI tuple only, but it is not cryptographic attestation verification. Legacy live orchestration throws on startup. Legacy proxy risk scores and the Python random-return model are not called by the supported pipeline.
 
-### 6) Reputation calibration
-- A reputation store updates agent weights based on consensus outcomes.
-- Over time, more reliable agents gain influence; noisy ones lose influence.
+The independent contract lab trusts an owner, an allowlist and a local mock DEX. It is not production custody. It uses separate policy semantics and is not called from the paper broker. See its README for limitations, including per-action turnover and outstanding-signature membership changes.
 
-### 7) Execution gating remains separate
-- Approved actions still go through the constraint engine.
-- Escalation blocks execution until human approval.
+## API
 
-### 8) Dashboard upgrades
-- UI now shows **risk drivers**, escalation reasons, consensus counts, and richer signal details
-  (confidence/reasons/evidence/constraints).
+- `GET /api/state` → `{ ok: true, mode: "PAPER", liveExecutionEnabled: false, run }`.
+- `GET /api/scenarios` → the seven scenario IDs, labels and descriptions.
+- `POST /api/run` with JSON `{ "scenario": "normal" }` → a complete new state.
+
+Unsupported content types return 415; invalid JSON/scenario/schema returns 400; oversized bodies return 413; disallowed origins return 403. Failed requests must not replace the previous run. The UI cancels superseded requests and does not append fabricated historical observations.
