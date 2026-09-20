@@ -4,42 +4,44 @@ import { nowIso } from "../util/time.js";
 import { ObservationFrame } from "../observe/types.js";
 import { CONFIG } from "../config.js";
 import { chatComplete, tryParseJson } from "../llm/llmClient.js";
+import { validateActionParameters } from "../constraints/constraints.js";
 
 async function fetchJson(url: string, body?: any) {
   const res = await fetch(url, {
     method: body ? "POST" : "GET",
     headers: { "content-type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(5_000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`);
   return res.json();
 }
 
+export function parseActionProposals(payload: unknown, proposalSource = "AnalystAgent:LLM"): ActionIntent[] {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
+  const actions = (payload as Record<string, unknown>).actions;
+  if (!Array.isArray(actions)) return [];
+  const allowed = new Set(["REBALANCE", "HEDGE", "REDEEM", "PAUSE", "UNPAUSE", "UPDATE_CONSTRAINTS"]);
+  const result: ActionIntent[] = [];
+  for (const a of actions) {
+    if (!a || typeof a !== "object" || Array.isArray(a)) continue;
+    if (Object.keys(a).some(key => !["type", "reason", "params"].includes(key))) continue;
+    const { type, reason, params } = a as Record<string, unknown>;
+    if (typeof type !== "string" || !allowed.has(type) || typeof reason !== "string") continue;
+    const intent: ActionIntent = {
+      type: type as ActionIntent["type"],
+      reason,
+      params: params as Record<string, unknown>,
+      proposalSource,
+    };
+    if (validateActionParameters(intent).ok) result.push(intent);
+    if (result.length >= 2) break;
+  }
+  return result;
+}
+
 export class AnalystAgent implements Agent {
   name = "AnalystAgent";
-
-  private parseLlmActions(payload: unknown): ActionIntent[] {
-    if (!payload || typeof payload !== "object") return [];
-    const actions = (payload as any).actions;
-    if (!Array.isArray(actions)) return [];
-    const allowed = new Set(["REBALANCE", "HEDGE", "REDEEM", "PAUSE", "UNPAUSE", "UPDATE_CONSTRAINTS"]);
-    const result: ActionIntent[] = [];
-    for (const a of actions) {
-      if (!a || typeof a !== "object") continue;
-      const type = String((a as any).type ?? "");
-      if (!allowed.has(type)) continue;
-      const reason = typeof (a as any).reason === "string" ? (a as any).reason : "LLM suggestion.";
-      const params = typeof (a as any).params === "object" && (a as any).params ? (a as any).params : {};
-      result.push({
-        type: type as any,
-        reason,
-        params,
-        proposalSource: `${this.name}:LLM`,
-      });
-      if (result.length >= 2) break;
-    }
-    return result;
-  }
 
   async run(frame: ObservationFrame): Promise<Signal[]> {
     // In a real build, you'd send time-series history, not just a snapshot.
@@ -49,17 +51,17 @@ export class AnalystAgent implements Agent {
     let modelError: string | null = null;
     try {
       const out = await fetchJson(`${CONFIG.modelServiceUrl}/suggest-hedges`, { positions: frame.positions });
-      suggestions = out.suggestions ?? [];
+      if (!out || typeof out !== "object" || !Array.isArray(out.suggestions)) throw new Error("Invalid model response schema");
+      suggestions = out.suggestions;
     } catch (e) {
       modelError = String(e);
     }
 
-    const recs: ActionIntent[] = suggestions.map(s => ({
+    const recs: ActionIntent[] = parseActionProposals({ actions: suggestions.filter(s => s && typeof s === "object").map(s => ({
       type: "HEDGE",
-      reason: s.reason ?? "Model suggests hedge based on learned co-movement.",
-      params: { against: s.against, instrument: s.instrument ?? "perp/option", notionalPct: s.notionalPct ?? 0.1, slippageBps: 25, turnover: 0.02 },
-      proposalSource: this.name,
-    }));
+      reason: s.reason ?? "Legacy model suggests a simulated hedge candidate.",
+      params: { against: s.against, instrument: s.instrument, notionalPct: s.notionalPct, slippageBps: 25 },
+    })) }, this.name);
 
     if (CONFIG.llmEnabled) {
       const res = await chatComplete([
@@ -78,7 +80,7 @@ export class AnalystAgent implements Agent {
       ]);
       if (res.ok && res.content) {
         const parsed = tryParseJson(res.content);
-        if (parsed) llmSuggestions = this.parseLlmActions(parsed);
+        if (parsed) llmSuggestions = parseActionProposals(parsed);
       }
     }
 

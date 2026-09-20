@@ -4,3 +4,8 @@ dist
 apps/middleware/audit.jsonl
 apps/model-service/.venv
 __pycache__
+artifacts/
+contracts/cache/
+contracts/typechain-types/
+coverage/
+*.tsbuildinfo

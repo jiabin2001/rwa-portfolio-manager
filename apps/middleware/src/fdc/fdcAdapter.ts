@@ -2,6 +2,7 @@ import fs from "node:fs";
 import {
   createPublicClient,
   createWalletClient,
+  decodeAbiParameters,
   http,
   parseAbi,
   type Address,
@@ -37,41 +38,45 @@ type FdcCache = {
 
 const CACHE_PATH = process.env.FDC_CACHE_PATH ?? "./fdc_cache.json";
 
-function findNavUsdE6(value: unknown, depth = 0): number | null {
-  if (depth > 6 || value == null) return null;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        return findNavUsdE6(parsed, depth + 1);
-      } catch {
-        return null;
-      }
-    }
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function positiveSafeInteger(value: unknown): number | null {
+  if (typeof value !== "number" && typeof value !== "bigint" &&
+      !(typeof value === "string" && /^[0-9]+$/.test(value))) return null;
+  const num = Number(value);
+  return Number.isSafeInteger(num) && num > 0 ? num : null;
+}
+
+/** Decode only the documented NAV field/wrappers; unrelated numeric leaves are
+ * never prices. This validates data shape, NOT the FDC cryptographic proof. */
+export function findNavUsdE6(value: unknown): number | null {
+  const root = record(value);
+  if (!root) return null;
+  const response = record(root.response);
+  const body = record(root.responseBody) ?? record(response?.responseBody);
+  const candidates = [root, response, body, record(body?.response)].filter((v): v is Record<string, unknown> => v !== null);
+  const explicit = candidates.filter(v => Object.hasOwn(v, "nav_usd_e6"));
+  if (explicit.length) {
+    const values = explicit.map(v => positiveSafeInteger(v.nav_usd_e6));
+    return values.every(v => v !== null && v === values[0]) ? values[0] : null;
+  }
+  const encoded = body?.abi_encoded_data ?? body?.abiEncodedData;
+  if (typeof encoded !== "string" || !/^0x[0-9a-fA-F]{128}$/.test(encoded)) return null;
+  // This adapter supports exactly (uint256 ts, uint256 nav_usd_e6). The
+  // placeholder SWAPI schema and any different configured tuple are rejected.
+  try {
+    const schema = JSON.parse(CONFIG.fdcWeb2Abi);
+    const components = schema?.components;
+    if (schema?.type !== "tuple" || !Array.isArray(components) || components.length !== 2 ||
+        components[0]?.name !== "ts" || components[0]?.type !== "uint256" ||
+        components[1]?.name !== "nav_usd_e6" || components[1]?.type !== "uint256") return null;
+    const [, nav] = decodeAbiParameters([{ type: "uint256" }, { type: "uint256" }], encoded as Hex);
+    return positiveSafeInteger(nav);
+  } catch {
     return null;
   }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findNavUsdE6(item, depth + 1);
-      if (found != null) return found;
-    }
-    return null;
-  }
-  if (typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-    if (Object.prototype.hasOwnProperty.call(obj, "nav_usd_e6")) {
-      const raw = obj["nav_usd_e6"];
-      const num = typeof raw === "number" ? raw : Number(raw);
-      return Number.isFinite(num) ? num : null;
-    }
-    for (const v of Object.values(obj)) {
-      const found = findNavUsdE6(v, depth + 1);
-      if (found != null) return found;
-    }
-  }
-  return null;
 }
 
 function loadCache(): FdcCache {
@@ -130,6 +135,7 @@ async function prepareWeb2JsonRequest(apiUrl: string, postProcessJq: string, abi
     method: "POST",
     headers: { "X-API-KEY": CONFIG.flareApiKey, "Content-Type": "application/json" },
     body: JSON.stringify(request),
+    signal: AbortSignal.timeout(10_000),
   });
 
   if (!resp.ok) {
@@ -183,6 +189,7 @@ async function retrieveProofByRequestRound(requestBytes: Hex, roundId: number): 
     method: "POST",
     headers: { "X-API-KEY": CONFIG.flareApiKey, "Content-Type": "application/json" },
     body: JSON.stringify({ votingRoundId: roundId, requestBytes }),
+    signal: AbortSignal.timeout(10_000),
   });
   if (!resp.ok) return null;
   return await resp.json();

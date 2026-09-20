@@ -1,906 +1,200 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { RiskGauge } from "./components/RiskGauge";
-import { Sparkline } from "./components/Sparkline";
-import {
-  Effect,
-  createClock,
-  createHttpClient,
-  createLogger,
-  createRuntime,
-  type Clock,
-  type Effect as EffectType,
-  type HttpClient,
-  type Logger,
-  type UiSink
-} from "../../../packages/shared/src/effects";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { PAPER_SCENARIOS, type PaperRun, type PaperScenarioId, type PaperStage } from "@rpm/shared";
+import { formatMoney, formatPercent, parsePaperState, stageResult, statusTone } from "./presentation";
 
-type ApiState = {
-  ok: boolean;
-  serverTime: string;
-  lastObservedAt?: string;
-  lastTickAt?: string;
-  lastRiskScore?: number;
-  lastDecision?: any;
-  lastSignals?: any[];
-  lastFrame?: any;
+const STAGES: PaperStage[] = ["DATA", "RISK", "PROPOSAL", "CONSENSUS", "CONSTRAINTS", "EXECUTION", "RECONCILIATION"];
+const STAGE_LABELS: Record<PaperStage, string> = {
+  DATA: "Data quality", RISK: "Risk analysis", PROPOSAL: "Proposal", CONSENSUS: "Consensus",
+  CONSTRAINTS: "Constraints", EXECUTION: "Paper execution", RECONCILIATION: "Reconciliation",
 };
 
-type UiUpdate = {
-  state: ApiState | null;
-  error: string;
-  history: number[];
-  lastRefreshedAt: string;
-  latencyMs: number | null;
-};
-
-type DashboardEnv = {
-  http: HttpClient;
-  clock: Clock;
-  log: Logger;
-  ui: UiSink<UiUpdate>;
-};
-
-function fmtTime(iso?: string) {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleString();
-  } catch {
-    return iso;
-  }
+function Badge({ value, label }: { value: string; label?: string }) {
+  return <span className={`badge badge--${statusTone(value)}`}>{label ?? value.replaceAll("_", " ")}</span>;
 }
 
-function fmtTimeShort(iso?: string) {
-  if (!iso || iso === "—") return "—";
-  try {
-    return new Date(iso).toLocaleTimeString();
-  } catch {
-    return iso;
-  }
+function Metric({ label, before, after, note }: { label: string; before: string; after: string; note: string }) {
+  return <div className="metric">
+    <div className="eyebrow">{label}</div>
+    <div className="metric-values"><span>{before}</span><span className="metric-arrow" aria-label="to">→</span><strong>{after}</strong></div>
+    <div className="muted small">{note}</div>
+  </div>;
 }
 
-function fmtConfidence(conf?: number) {
-  if (!Number.isFinite(conf)) return "—";
-  return `${Math.round((conf ?? 0) * 100)}%`;
-}
+function RunResults({ run }: { run: PaperRun }) {
+  const validPrices = run.dataQuality === "VALID";
+  const assetIds = [...new Set([...Object.keys(run.before.units), ...Object.keys(run.after.units)])];
+  const scenario = PAPER_SCENARIOS.find((item) => item.id === run.scenario);
+  const constraints = stageResult(run, "CONSTRAINTS");
+  const execution = stageResult(run, "EXECUTION");
+  const reconciled = run.audit.some((event) => event.stage === "RECONCILIATION");
+  return <div className="results" key={run.runId}>
+    <section className={`outcome outcome--${statusTone(run.status)}`} aria-labelledby="outcome-heading">
+      <div className="outcome-main">
+        <div className="eyebrow">Final outcome <span className="separator">/</span> {scenario?.title ?? run.scenario}</div>
+        <h2 id="outcome-heading">{run.status.replaceAll("_", " ")}</h2>
+        <ul className="reasons">{run.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>
+      </div>
+      <dl className="run-stamp">
+        <div><dt>Replay ID</dt><dd>{run.runId}</dd></div>
+        <div><dt>Fixture as of</dt><dd>{new Date(run.asOf).toISOString().replace("T", " ").replace(".000Z", " UTC")}</dd></div>
+        <div><dt>Data quality</dt><dd><Badge value={run.dataQuality} /></dd></div>
+      </dl>
+    </section>
 
-function actionKey(a: any) {
-  return `${a?.type ?? ""}|${JSON.stringify(a?.params ?? {})}|${JSON.stringify(a?.route ?? {})}`;
-}
+    <ol className="stage-strip" aria-label="Replay stages">
+      {STAGES.map((stage, index) => {
+        const result = stageResult(run, stage);
+        return <li key={stage} className={`stage stage--${statusTone(result)}`}>
+          <span className="stage-number">0{index + 1}</span>
+          <strong>{STAGE_LABELS[stage]}</strong>
+          <span>{result.replaceAll("_", " ")}</span>
+        </li>;
+      })}
+    </ol>
 
-function timeSort(a: any, b: any) {
-  const ta = Date.parse(a?.createdAt ?? "") || 0;
-  const tb = Date.parse(b?.createdAt ?? "") || 0;
-  return ta - tb;
-}
+    <section className="panel portfolio-panel" aria-labelledby="portfolio-heading">
+      <div className="section-heading"><div><div className="eyebrow">01 / Portfolio</div><h2 id="portfolio-heading">The ledger, before & after</h2></div><span className="caption">USD · synthetic fixture</span></div>
+      <div className="balance-metrics">
+        <Metric label="Portfolio equity" before={formatMoney(run.equityBeforeCents)} after={formatMoney(run.equityAfterCents)} note="Marked at fixture prices; costs included." />
+        <Metric label="Cash balance" before={formatMoney(run.before.cashCents)} after={formatMoney(run.after.cashCents)} note="Integer-cent ledger, after fees." />
+      </div>
+      <div className="table-scroll" role="region" aria-label="Portfolio positions" tabIndex={0}>
+        <table className="positions-table">
+          <thead><tr><th scope="col">Asset</th><th scope="col">Fixture price</th><th scope="col">Units before</th><th scope="col">Units after</th><th scope="col">Value after</th></tr></thead>
+          <tbody>{assetIds.map((assetId) => {
+            const price = validPrices ? run.pricesCents[assetId] : undefined;
+            const afterUnits = run.after.units[assetId] ?? 0;
+            return <tr key={assetId}>
+              <th scope="row"><span>{run.assetNames[assetId] ?? assetId}</span><code>{assetId}</code></th>
+              <td>{formatMoney(price)}</td><td>{(run.before.units[assetId] ?? 0).toLocaleString("en-US")}</td>
+              <td className={afterUnits !== run.before.units[assetId] ? "changed" : ""}>{afterUnits.toLocaleString("en-US")}</td>
+              <td>{formatMoney(price == null ? null : price * afterUnits)}</td>
+            </tr>;
+          })}</tbody>
+        </table>
+      </div>
+    </section>
 
-function sevClass(sev: string) {
-  switch (sev) {
-    case "CRITICAL": return "crit";
-    case "HIGH": return "high";
-    case "WARN": return "warn";
-    case "INFO":
-    default: return "info";
-  }
-}
+    <section className="panel risk-panel" aria-labelledby="risk-heading">
+      <div className="section-heading"><div><div className="eyebrow">02 / Risk</div><h2 id="risk-heading">Measure the change</h2></div><Badge value={run.riskAfter ? "SYNTHETIC" : "UNKNOWN"} /></div>
+      <p className="section-note">Historical simulation on fixed synthetic returns. These are scenario diagnostics, not a forecast or validated investment model.</p>
+      <div className="risk-metrics">
+        <Metric label="Largest position" before={formatPercent(run.riskBefore?.concentration, true)} after={formatPercent(run.riskAfter?.concentration, true)} note="Concentration as a share of portfolio equity." />
+        <Metric label="Historical VaR · 95%" before={formatPercent(run.riskBefore?.historicalVar95Pct)} after={formatPercent(run.riskAfter?.historicalVar95Pct)} note="One-day loss at the 95th percentile." />
+        <Metric label="Expected shortfall · 95%" before={formatPercent(run.riskBefore?.historicalEs95Pct)} after={formatPercent(run.riskAfter?.historicalEs95Pct)} note="Mean loss at or above the VaR threshold." />
+        <Metric label="Maximum drawdown" before={formatPercent(run.riskBefore?.maxDrawdownPct)} after={formatPercent(run.riskAfter?.maxDrawdownPct)} note={run.riskAfter ? `${run.riskAfter.samples} synthetic daily observations.` : "Risk is unknown when source data is invalid."} />
+      </div>
+      {run.riskBefore && run.riskAfter && run.riskAfter.historicalVar95Pct > run.riskBefore.historicalVar95Pct && <p className="risk-tradeoff"><span>Trade-off</span>Concentration decreased, but historical VaR increased on this fixture. A concentration rebalance does not guarantee lower portfolio loss risk.</p>}
+    </section>
 
-function scoreToSev(score?: number) {
-  const s = score ?? 0;
-  if (s >= 90) return "CRITICAL";
-  if (s >= 75) return "HIGH";
-  if (s >= 60) return "WARN";
-  return "INFO";
-}
+    <div className="two-column">
+      <section className="panel" aria-labelledby="decision-heading">
+        <div className="section-heading"><div><div className="eyebrow">03 / Decision</div><h2 id="decision-heading">Independent gates</h2></div></div>
+        <div className="proposal">
+          <span className="eyebrow">Proposed action</span>
+          <strong>{run.action ? `Sell ${run.action.units.toLocaleString("en-US")} ${run.action.assetId}` : "No proposal"}</strong>
+          <span className="muted small">{run.action ? `Limit price ${formatMoney(run.action.limitPriceCents)} · proposal only` : "The pipeline did not produce an action."}</span>
+        </div>
+        <div className="gate-row"><span>Consensus</span><Badge value={run.consensus?.status ?? "NOT_REACHED"} /></div>
+        {run.consensus && <>
+          <div className="consensus-measure" aria-label={`Support ${formatPercent(run.consensus.support, true)}, threshold ${formatPercent(run.consensus.threshold, true)}`}>
+            <div className="support-track"><span style={{ width: `${Math.min(100, Math.max(0, run.consensus.support * 100))}%` }} /><i style={{ left: `${run.consensus.threshold * 100}%` }} /></div>
+            <div className="small muted"><span>Support {formatPercent(run.consensus.support, true)}</span><span>Required {formatPercent(run.consensus.threshold, true)}</span></div>
+          </div>
+          <details className="votes-details"><summary>Inspect votes <span>{run.consensus.votes.length}</span></summary>
+            <ul className="votes">{run.consensus.votes.map((vote, index) => <li key={`${vote.agentId}-${index}`}><div><code>{vote.agentId}</code><Badge value={vote.stance} /></div><p>{vote.reason}</p></li>)}</ul>
+            <p className="small muted">{run.consensus.duplicateVotesIgnored} duplicate vote(s) ignored. Abstentions do not count as support.</p>
+          </details>
+        </>}
+        <div className="gate-row"><span>Constraints</span><Badge value={constraints} /></div>
+        <p className="small muted">Consensus approval does not imply a fill. Constraints and execution are evaluated separately.</p>
+      </section>
 
-function severityRank(sev?: string) {
-  switch (sev) {
-    case "CRITICAL": return 4;
-    case "HIGH": return 3;
-    case "WARN": return 2;
-    case "INFO":
-    default: return 1;
-  }
-}
+      <section className="panel" aria-labelledby="execution-heading">
+        <div className="section-heading"><div><div className="eyebrow">04 / Execution</div><h2 id="execution-heading">Paper fills & settlement</h2></div><Badge value={execution} /></div>
+        {run.fills.length ? run.fills.map((fill) => <div className="fill" key={fill.fillId}>
+          <div className="fill-title"><strong>Sold {fill.units.toLocaleString("en-US")} {fill.assetId}</strong><span className="caption">PAPER FILL</span></div>
+          <dl className="facts"><div><dt>Fill price</dt><dd>{formatMoney(fill.priceCents)}</dd></div><div><dt>Gross proceeds</dt><dd>{formatMoney(fill.grossCents)}</dd></div><div><dt>Fee</dt><dd>{formatMoney(fill.feeCents)}</dd></div><div><dt>Slippage cost</dt><dd>{formatMoney(fill.slippageCostCents)}</dd></div></dl>
+          <div className="identifier">Fill ID <code>{fill.fillId}</code></div>
+        </div>) : <div className="empty-fill"><span aria-hidden="true">—</span><strong>No fill recorded</strong><p>The ledger only changes after a successful paper execution.</p></div>}
+        <div className="gate-row reconciliation"><span>Reconciliation</span><Badge value={reconciled ? (run.reconciliation.ok ? "PASS" : "FAILED") : "NOT_REACHED"} /></div>
+        <dl className="facts compact"><div><dt>Cash movement</dt><dd>{formatMoney(run.reconciliation.cashDeltaCents)}</dd></div><div><dt>Equity change</dt><dd>{formatMoney(run.reconciliation.equityChangeCents)}</dd></div><div><dt>Expected costs</dt><dd>{formatMoney(run.reconciliation.expectedCostCents)}</dd></div><div><dt>Unit accounting</dt><dd>{reconciled ? (run.reconciliation.unitsConserved ? "PASS" : "FAILED") : "NOT REACHED"}</dd></div></dl>
+      </section>
+    </div>
 
-function escalationLabel(score?: number, escalationRequired?: boolean) {
-  if (escalationRequired) return "Escalate";
-  const sev = scoreToSev(score);
-  if (sev === "CRITICAL") return "Escalate";
-  if (sev === "HIGH") return "High";
-  if (sev === "WARN") return "Watch";
-  return "Normal";
-}
-
-function trendDelta(values: number[]) {
-  if (values.length < 2) return 0;
-  return values[values.length - 1] - values[values.length - 2];
-}
-
-function safeStr(x: any) {
-  if (x == null) return "—";
-  if (typeof x === "string") return x;
-  return JSON.stringify(x);
-}
-
-function normalizeError(err: unknown) {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
-  return JSON.stringify(err);
-}
-
-function updateHistory(prev: number[], nextScore?: number) {
-  if (!Number.isFinite(nextScore)) return prev;
-  return [...prev, Number(nextScore)].slice(-60);
-}
-
-function signalKey(s: any) {
-  return `${s?.agent ?? ""}|${s?.kind ?? ""}|${s?.createdAt ?? ""}`;
-}
-
-function isSameTick(createdAt?: string, tickAt?: string) {
-  if (!createdAt || !tickAt) return false;
-  return createdAt.slice(0, 19) === tickAt.slice(0, 19);
+    <section className="panel audit-panel" aria-labelledby="audit-heading">
+      <div className="section-heading"><div><div className="eyebrow">05 / Evidence</div><h2 id="audit-heading">Every stage leaves a receipt</h2></div><span className="caption">{run.audit.length} ordered events</span></div>
+      <p className="section-note">A deterministic hash chain links this replay’s events. Expand a stage to inspect its payload and hashes.</p>
+      <ol className="audit-timeline">{run.audit.map((event) => <li key={`${event.runId}-${event.sequence}`}>
+        <span className={`audit-marker marker--${statusTone(event.status)}`}>{String(event.sequence).padStart(2, "0")}</span>
+        <details className="audit-event"><summary><span className="audit-title">{STAGE_LABELS[event.stage]}</span><Badge value={event.status} /><span className="audit-summary">{event.message}</span><span className="expand-label">Inspect <span aria-hidden="true">+</span></span></summary>
+          <div className="audit-detail"><dl className="hash-list"><div><dt>Event time</dt><dd>{event.at}</dd></div><div><dt>Tick ID</dt><dd>{event.tickId}</dd></div><div><dt>Previous hash</dt><dd>{event.previousHash}</dd></div><div><dt>Event hash</dt><dd>{event.hash}</dd></div></dl><pre>{JSON.stringify(event.payload, null, 2)}</pre></div>
+        </details>
+      </li>)}</ol>
+      <details className="provenance"><summary>Replay provenance <span>Dataset · policy · audit head</span></summary><dl className="hash-list"><div><dt>Dataset</dt><dd>{run.datasetId}</dd></div><div><dt>Dataset hash</dt><dd>{run.datasetHash}</dd></div><div><dt>Policy hash</dt><dd>{run.policyHash}</dd></div><div><dt>Audit head</dt><dd>{run.auditHead}</dd></div><div><dt>Schema</dt><dd>v{run.schemaVersion}</dd></div></dl></details>
+    </section>
+  </div>;
 }
 
 export function App() {
-  const [state, setState] = useState<ApiState | null>(null);
-  const [error, setError] = useState<string>("");
-  const [query, setQuery] = useState<string>("");
-  const [sevFilter, setSevFilter] = useState<string>("ALL");
-  const [riskOnly, setRiskOnly] = useState(false);
-  const [tickOnly, setTickOnly] = useState(false);
-  const [selected, setSelected] = useState<any | null>(null);
-  const [lastRefreshedAt, setLastRefreshedAt] = useState<string>("—");
-  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [run, setRun] = useState<PaperRun | null>(null);
+  const [scenario, setScenario] = useState<PaperScenarioId>("normal");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState("");
+  const [receivedAt, setReceivedAt] = useState("");
+  const requestId = useRef(0);
+  const controller = useRef<AbortController | null>(null);
 
-  const historyRef = useRef<number[]>([]);
-  const [history, setHistory] = useState<number[]>([]);
-  const stateRef = useRef<ApiState | null>(null);
-
-  const applyUpdate = useCallback((update: UiUpdate) => {
-    stateRef.current = update.state;
-    historyRef.current = update.history;
-    setState(update.state);
-    setHistory(update.history);
-    setError(update.error);
-    setLastRefreshedAt(update.lastRefreshedAt);
-    setLatencyMs(update.latencyMs);
+  const load = useCallback(async (selected?: PaperScenarioId) => {
+    const id = ++requestId.current;
+    controller.current?.abort();
+    const requestController = new AbortController();
+    controller.current = requestController;
+    setPending(true);
+    setError("");
+    let timedOut = false;
+    const timeout = window.setTimeout(() => { timedOut = true; requestController.abort(); }, 10000);
+    try {
+      const response = await fetch(selected ? "/api/run" : "/api/state", {
+        method: selected ? "POST" : "GET",
+        ...(selected ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scenario: selected }) } : {}),
+        cache: "no-store", signal: requestController.signal,
+      });
+      if (!response.ok) throw new Error(`The replay service returned HTTP ${response.status}.`);
+      const state = parsePaperState(await response.json());
+      if (id !== requestId.current || requestController.signal.aborted) return;
+      setRun(state.run);
+      setReceivedAt(new Date().toLocaleTimeString("en-GB"));
+    } catch (cause) {
+      if (id !== requestId.current) return;
+      if (requestController.signal.aborted && !timedOut) return;
+      setError(timedOut ? "The replay service did not respond within 10 seconds. Retry when it is available." : cause instanceof Error ? cause.message : "Could not load the replay service.");
+    } finally {
+      window.clearTimeout(timeout);
+      if (id === requestId.current) setPending(false);
+    }
   }, []);
 
-  const runtime = useMemo(() => {
-    return createRuntime<DashboardEnv>({
-      http: createHttpClient(),
-      clock: createClock(),
-      log: createLogger(),
-      ui: { apply: applyUpdate }
-    });
-  }, [applyUpdate]);
-
-  const fetchStateEffect = useCallback<EffectType<DashboardEnv, { next: ApiState; latencyMs: number; fetchedAt: string }>>(
-    async (env, signal) => {
-      const startedAt = env.clock.nowMs();
-      const next = await env.http.getJson<ApiState>("/api/state", { signal });
-      const latency = Math.max(0, Math.round(env.clock.nowMs() - startedAt));
-      return {
-        next,
-        latencyMs: latency,
-        fetchedAt: env.clock.nowIso()
-      };
-    },
-    []
-  );
-
-  const refreshOnce = useCallback<EffectType<DashboardEnv, void>>(async (env, signal) => {
-    try {
-      const { next, latencyMs: latency, fetchedAt } = await fetchStateEffect(env, signal);
-      const nextHistory = updateHistory(historyRef.current, next?.lastRiskScore);
-      env.ui.apply({
-        state: next,
-        error: "",
-        history: nextHistory,
-        lastRefreshedAt: fetchedAt,
-        latencyMs: latency
-      });
-    } catch (err) {
-      if (signal.aborted) return;
-      env.ui.apply({
-        state: stateRef.current,
-        error: normalizeError(err),
-        history: historyRef.current,
-        lastRefreshedAt: env.clock.nowIso(),
-        latencyMs: null
-      });
-    }
-  }, [fetchStateEffect]);
-
-  const poller = useCallback<EffectType<DashboardEnv, void>>(async (env, signal) => {
-    let nextHistory = historyRef.current;
-    while (!signal.aborted) {
-      try {
-        const { next, latencyMs: latency, fetchedAt } = await Effect.retry(fetchStateEffect, {
-          retries: 1,
-          delayMs: 250
-        })(env, signal);
-        nextHistory = updateHistory(nextHistory, next?.lastRiskScore);
-        env.ui.apply({
-          state: next,
-          error: "",
-          history: nextHistory,
-          lastRefreshedAt: fetchedAt,
-          latencyMs: latency
-        });
-      } catch (err) {
-        if (signal.aborted) return;
-        env.ui.apply({
-          state: stateRef.current,
-          error: normalizeError(err),
-          history: nextHistory,
-          lastRefreshedAt: env.clock.nowIso(),
-          latencyMs: null
-        });
-      }
-
-      await Effect.sleep<DashboardEnv>(2000)(env, signal);
-    }
-  }, [fetchStateEffect]);
-
   useEffect(() => {
-    const run = runtime.run(poller);
-    return () => run.cancel();
-  }, [runtime, poller]);
+    void load();
+    return () => { requestId.current += 1; controller.current?.abort(); };
+  }, [load]);
 
-  const signals = useMemo(() => (state?.lastSignals ?? []).slice(), [state]);
-  const decision = state?.lastDecision;
-  const frame = state?.lastFrame;
-
-  const filteredSignals = useMemo(() => {
-    return signals
-      .filter((s: any) => {
-        if (sevFilter === "ALL") return true;
-        return String(s?.severity ?? "") === sevFilter;
-      })
-      .filter((s: any) => {
-        if (!riskOnly) return true;
-        const hay = `${s?.agent ?? ""} ${s?.kind ?? ""} ${s?.summary ?? ""}`.toLowerCase();
-        return hay.includes("risk") || hay.includes("liquidity") || hay.includes("credit");
-      })
-      .filter((s: any) => {
-        if (!tickOnly) return true;
-        return isSameTick(s?.createdAt, state?.lastTickAt);
-      })
-      .filter((s: any) => {
-        if (!query.trim()) return true;
-        const q = query.trim().toLowerCase();
-        return (
-          String(s?.agent ?? "").toLowerCase().includes(q) ||
-          String(s?.kind ?? "").toLowerCase().includes(q) ||
-          String(s?.summary ?? "").toLowerCase().includes(q)
-        );
-      })
-      .slice(0, 25);
-  }, [signals, sevFilter, query, riskOnly, tickOnly, state?.lastTickAt]);
-
-  const positions = useMemo(() => (frame?.positions ?? []) as any[], [frame]);
-  const totalValue = useMemo(() => {
-    return positions.reduce((acc, p) => acc + Number(p?.value ?? 0), 0);
-  }, [positions]);
-
-  const datapoints = useMemo(() => (frame?.data ?? []) as any[], [frame]);
-
-  const apiOk = Boolean(state?.ok) && !error;
-  const selectedKey = selected ? signalKey(selected) : "";
-  const escalationStatus = escalationLabel(state?.lastRiskScore, decision?.escalationRequired);
-  const trend = trendDelta(history);
-  const primaryAction = decision?.approvedActions?.[0];
-  const riskMetrics = decision?.riskMetrics ?? [];
-  const timeline = useMemo(() => {
-    const items = (signals ?? []).map((s: any) => ({
-      id: signalKey(s),
-      createdAt: s?.createdAt,
-      time: (s?.createdAt ?? "").slice(11, 19) || "—",
-      severity: s?.severity ?? "INFO",
-      title: s?.agent ?? "Agent",
-      summary: s?.summary ?? "",
-      kind: s?.kind ?? "SIGNAL",
-    }));
-    if (decision?.decisionId) {
-      items.push({
-        id: `decision-${decision.decisionId}`,
-        createdAt: decision.createdAt,
-        time: (decision.createdAt ?? "").slice(11, 19) || "—",
-        severity: decision.escalationRequired ? "CRITICAL" : scoreToSev(decision.riskScore),
-        title: "Decision",
-        summary: decision.escalationRequired ? "Escalation required." : "Decision approved for execution path.",
-        kind: "DECISION",
-      });
-    }
-    return items.sort(timeSort);
-  }, [signals, decision]);
-
-  const consensusIndex = useMemo(() => {
-    const map = new Map<string, any>();
-    const consensus = decision?.consensus;
-    if (!consensus) return map;
-    [...(consensus.approved ?? []), ...(consensus.denied ?? []), ...(consensus.escalated ?? [])].forEach((entry: any) => {
-      map.set(actionKey(entry.intent), entry);
-    });
-    return map;
-  }, [decision]);
-
-  const sortedSignals = useMemo(() => {
-    return [...signals].sort((a: any, b: any) => severityRank(b?.severity) - severityRank(a?.severity));
-  }, [signals]);
-  const topSignals = sortedSignals.slice(0, 3);
-  const remainingSignals = sortedSignals.slice(3);
-
-  return (
-    <div className="page">
-      <div className="topbar">
-        <div className="nav">
-          <div className="brand">
-            <div className="logo" />
-            <div className="title">
-              <h1>RWA Portfolio Manager</h1>
-              <div className="sub">Risk Management Middleware · Demo Dashboard</div>
-            </div>
-          </div>
-
-          <div className="toolbar">
-            <span className="pill">
-              <span className={`dot ${apiOk ? "" : "bad"}`} />
-              API {apiOk ? "Connected" : "Disconnected"}
-            </span>
-            <span className="pill">
-              <span className="mono">Latency</span>
-              <span className="mono">{latencyMs == null ? "—" : `${latencyMs}ms`}</span>
-            </span>
-            <span className="pill">
-              <span className="mono">Server</span>
-              <span className="mono">{(state?.serverTime ?? "—").slice(11, 19)}</span>
-            </span>
-            <span className="pill">
-              <span className="mono">Last refresh</span>
-              <span className="mono">{fmtTimeShort(lastRefreshedAt)}</span>
-            </span>
-            <button
-              className="btn"
-              onClick={() => {
-                const run = runtime.run(refreshOnce);
-                run.promise.catch(() => undefined);
-              }}
-            >
-              Refresh
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div className="grid">
-        {/* Summary Hero */}
-        <section className="hero">
-          <div className="card strong heroCard">
-            <div className="cardHeader heroHeader">
-              <div>
-                <h2>Risk Score</h2>
-                <div className="hint">Real-time risk posture</div>
-              </div>
-            </div>
-            <div className="heroBody heroRiskBody">
-              <div className="heroRiskLeft">
-                <div className="heroRiskGaugeWrap">
-                  <RiskGauge score={state?.lastRiskScore ?? 0} size={98} showLabel={false} />
-                  <div className={`trend heroRiskTrend ${trend >= 0 ? "up" : "down"}`}>
-                    {trend >= 0 ? "▲" : "▼"} {Math.abs(trend).toFixed(1)}
-                  </div>
-                </div>
-              </div>
-              <div className="heroRiskRight">
-                <Sparkline values={history} />
-                <div className="small">last 60 ticks</div>
-              </div>
-            </div>
-          </div>
-
-          <div className="card heroCard">
-            <div className="cardHeader heroHeader">
-              <div>
-                <h2>Escalation</h2>
-                <div className="hint">Policy gate status</div>
-              </div>
-              <span className="pill mono">{decision?.decisionId ? decision.decisionId.slice(0, 8) : "—"}</span>
-            </div>
-            <div className="statusBlock">
-              <div className={`statusPill ${escalationStatus.toLowerCase()}`}>{escalationStatus}</div>
-              <div className="statusBar">
-                <div className={`statusFill ${escalationStatus.toLowerCase()}`} />
-              </div>
-              <div className="small">
-                {decision?.escalationRequired ? "Human oversight required" : "Autonomy path within policy"}
-              </div>
-            </div>
-          </div>
-
-          <div className="card strong heroCard">
-            <div className="cardHeader heroHeader">
-              <div>
-                <h2>Primary Next Action</h2>
-                <div className="hint">Recommended execution focus</div>
-              </div>
-              <div className="pill mono">{primaryAction?.type ?? "—"}</div>
-            </div>
-            <div className="actionHero">
-              <button className="btn primaryAction">
-                {primaryAction?.type ?? "No action"}
-              </button>
-              <div className="small">
-                {primaryAction?.reason ?? "No approved actions in the latest decision."}
-              </div>
-              <div className="chipRow">
-                <span className="chip mono">{safeStr(primaryAction?.params ?? "—")}</span>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* KPI Row */}
-        <section className="kpis">
-          <div className="card kpi soft">
-            <div className="label">Last Tick</div>
-            <div className="value">{fmtTime(state?.lastTickAt)}</div>
-            <div className="meta mono">{state?.lastTickAt ? state.lastTickAt.slice(11, 19) : "—"}</div>
-          </div>
-
-          <div className="card kpi soft">
-            <div className="label">Escalation</div>
-            <div className="value">{decision ? (decision.escalationRequired ? "YES" : "NO") : "—"}</div>
-            <div className="meta">{decision?.escalationRequired ? "Human oversight required" : "Bounded autonomy path"}</div>
-          </div>
-
-          <div className="card kpi soft">
-            <div className="label">Signals (latest)</div>
-            <div className="value">{signals.length}</div>
-            <div className="meta">Showing top 25</div>
-          </div>
-        </section>
-
-        {/* Main split */}
-        <section className="split">
-          <div className="card">
-            <div className="cardHeader">
-              <div>
-                <h2>Decision</h2>
-                <div className="hint">Consensus aggregation + policy gate</div>
-              </div>
-              <div className="pill mono">{decision?.decisionId ? decision.decisionId.slice(0, 8) : "—"}</div>
-            </div>
-
-            {decision ? (
-              <>
-                <div className="kv">
-                  <div className="k">Decision ID</div>
-                  <div className="v mono">{decision.decisionId}</div>
-
-                  <div className="k">Created At</div>
-                  <div className="v mono">{decision.createdAt}</div>
-
-                  <div className="k">Escalation</div>
-                  <div className="v">
-                    <span className={`badge ${decision.escalationRequired ? "crit" : "info"}`}>
-                      {decision.escalationRequired ? "YES" : "NO"}
-                    </span>
-                  </div>
-
-                  <div className="k">Weights</div>
-                  <div className="v mono">{decision.agentWeights ? "Reputation-adjusted" : "Static"}</div>
-                </div>
-
-                <div className="divider" />
-
-                <div className="subsection">
-                  <div className="subHeader">
-                    <span className="label">Rationale</span>
-                    <span className="small mono">Top signals</span>
-                  </div>
-                  <div className="signalList">
-                    {topSignals.map((s: any) => (
-                      <div className="signalItem" key={signalKey(s)}>
-                        <span className={`badge ${sevClass(s?.severity ?? "INFO")}`}>{s?.severity ?? "INFO"}</span>
-                        <div className="signalMain">
-                          <div className="signalTitle">{s?.agent}</div>
-                          <div className="signalSummary">{s?.summary}</div>
-                        </div>
-                        <div className="mono signalTime">{(s?.createdAt ?? "").slice(11, 19) || "—"}</div>
-                      </div>
-                    ))}
-                    {topSignals.length === 0 ? <div className="small">No signals yet.</div> : null}
-                  </div>
-                  {remainingSignals.length ? (
-                    <details className="accordion">
-                      <summary className="pill" style={{ cursor: "pointer", userSelect: "none" }}>
-                        Show all ({remainingSignals.length})
-                      </summary>
-                      <div className="signalList" style={{ marginTop: 10 }}>
-                        {remainingSignals.map((s: any) => (
-                          <div className="signalItem" key={signalKey(s)}>
-                            <span className={`badge ${sevClass(s?.severity ?? "INFO")}`}>{s?.severity ?? "INFO"}</span>
-                            <div className="signalMain">
-                              <div className="signalTitle">{s?.agent}</div>
-                              <div className="signalSummary">{s?.summary}</div>
-                            </div>
-                            <div className="mono signalTime">{(s?.createdAt ?? "").slice(11, 19) || "—"}</div>
-                          </div>
-                        ))}
-                      </div>
-                    </details>
-                  ) : null}
-                </div>
-
-                <div className="divider" />
-
-                <div className="subsection">
-                  <div className="subHeader">
-                    <span className="label riskDriversTitle">Risk Drivers</span>
-                    <span className="small mono">{riskMetrics.length}</span>
-                  </div>
-                  <div className="metricGrid">
-                    {riskMetrics.map((m: any, i: number) => (
-                      <div className="metricCard" key={i}>
-                        <div className="metricName">{m.name}</div>
-                        <div className="metricValue">{Number(m.value ?? 0).toFixed(3)}</div>
-                        <div className="small">{m.explanation}</div>
-                      </div>
-                    ))}
-                    {riskMetrics.length === 0 ? <div className="small">No metrics yet.</div> : null}
-                  </div>
-                </div>
-
-                {decision?.escalationReasons?.length ? (
-                  <>
-                    <div className="divider" />
-                    <div className="subsection">
-                      <div className="subHeader">
-                        <span className="label">Escalation Reasons</span>
-                      </div>
-                      <ul className="bulletList">
-                        {decision.escalationReasons.map((r: string, i: number) => (
-                          <li key={i}>{r}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  </>
-                ) : null}
-
-                {decision?.consensus ? (
-                  <>
-                    <div className="divider" />
-                    <div className="subsection">
-                      <div className="subHeader">
-                        <span className="label">Consensus</span>
-                        <span className="small mono">threshold {decision.consensus.thresholdWeight.toFixed(2)}</span>
-                      </div>
-                      <div className="consensusGrid">
-                        <div className="consensusItem">
-                          <div className="label">Approved</div>
-                          <div className="value mono">{decision.consensus.approved.length}</div>
-                        </div>
-                        <div className="consensusItem">
-                          <div className="label">Denied</div>
-                          <div className="value mono">{decision.consensus.denied.length}</div>
-                        </div>
-                        <div className="consensusItem">
-                          <div className="label">Escalate</div>
-                          <div className="value mono">{decision.consensus.escalated.length}</div>
-                        </div>
-                      </div>
-                    </div>
-                  </>
-                ) : null}
-
-                <div className="divider" />
-
-                <div className="split" style={{ gridTemplateColumns: "1fr 1fr" }}>
-                  <div>
-                    <div className="cardHeader" style={{ marginBottom: 8 }}>
-                      <h2>Approved Actions</h2>
-                      <div className="hint">{(decision.approvedActions ?? []).length}</div>
-                    </div>
-                    <div className="actions">
-                      {(decision.approvedActions ?? []).map((a: any, i: number) => {
-                        const consensus = consensusIndex.get(actionKey(a));
-                        return (
-                        <div className="actionItem" key={i}>
-                          <div className="left">
-                            <div className="type mono">{a.type}</div>
-                            <div className="reason">{a.reason}</div>
-                            <div className="chip mono">{safeStr(a.params)}</div>
-                            {consensus ? (
-                              <div className="small mono">
-                                support {consensus.supportWeight.toFixed(2)} / oppose {consensus.opposeWeight.toFixed(2)}
-                              </div>
-                            ) : null}
-                          </div>
-                        </div>
-                      )})}
-                      {(decision.approvedActions ?? []).length === 0 ? (
-                        <div className="small">No approved actions.</div>
-                      ) : null}
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="cardHeader" style={{ marginBottom: 8 }}>
-                      <h2>Denied Actions</h2>
-                      <div className="hint">{(decision.deniedActions ?? []).length}</div>
-                    </div>
-                    <div className="actions">
-                      {(decision.deniedActions ?? []).map((d: any, i: number) => {
-                        const consensus = consensusIndex.get(actionKey(d.intent));
-                        return (
-                        <div className="actionItem" key={i}>
-                          <div className="left">
-                            <div className="type mono">{d.intent?.type ?? "—"}</div>
-                            <div className="reason">{d.reason}</div>
-                            <div className="chip mono">{safeStr(d.intent?.params)}</div>
-                            {consensus ? (
-                              <div className="small mono">
-                                support {consensus.supportWeight.toFixed(2)} / oppose {consensus.opposeWeight.toFixed(2)}
-                              </div>
-                            ) : null}
-                          </div>
-                        </div>
-                      )})}
-                      {(decision.deniedActions ?? []).length === 0 ? (
-                        <div className="small">No denied actions.</div>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-              </>
-            ) : (
-              <div className="small">No decision yet.</div>
-            )}
-
-            {error ? <div className="small" style={{ color: "rgba(255,93,123,.9)", marginTop: 10 }}>{error}</div> : null}
-          </div>
-
-          <div className="card soft">
-            <div className="cardHeader">
-              <div>
-                <h2>Decision Timeline</h2>
-                <div className="hint">Chronological log of signals + decision</div>
-              </div>
-              <span className="pill mono">{timeline.length} events</span>
-            </div>
-            <div className="timeline">
-              {timeline.length ? (
-                timeline.map((t: any) => (
-                  <div className="timelineRow" key={t.id}>
-                    <div className={`timelineDot ${sevClass(t.severity)}`} />
-                    <div className="timelineBody">
-                      <div className="timelineHeader">
-                        <span className="badge">{t.kind}</span>
-                        <span className={`badge ${sevClass(t.severity)}`}>{t.severity}</span>
-                        <span className="mono timelineTime">{t.time}</span>
-                      </div>
-                      <div className="timelineTitle">{t.title}</div>
-                      <div className="timelineSummary">{t.summary}</div>
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <div className="small">No timeline events yet.</div>
-              )}
-            </div>
-          </div>
-
-          <div className="card soft spanAll">
-            <div className="cardHeader">
-              <div>
-                <h2>Observation Frame</h2>
-                <div className="hint">Positions + data points used by agents</div>
-              </div>
-              <span className="pill mono">{(state?.lastObservedAt ?? "—").slice(11, 19)}</span>
-            </div>
-
-            <div style={{ marginBottom: 12 }}>
-              <div className="pill" style={{ justifyContent: "space-between", width: "100%" }}>
-                <span>Total Portfolio Value</span>
-                <span className="mono">{totalValue.toFixed(2)}</span>
-              </div>
-            </div>
-
-            <div style={{ marginBottom: 12 }}>
-              <div className="cardHeader" style={{ marginBottom: 8 }}>
-                <h2>Positions</h2>
-                <div className="hint">{positions.length}</div>
-              </div>
-              <div className="positions">
-                {positions.map((p: any, i: number) => {
-                  const v = Number(p?.value ?? 0);
-                  const pct = totalValue > 0 ? (v / totalValue) : 0;
-                  return (
-                    <div className="posRow" key={i}>
-                      <div className="posLeft">
-                        <div className="mono posName">{p.symbol}</div>
-                        <div className="posTag">Tokenized Asset</div>
-                        <div className="small mono">{p.assetId}</div>
-                      </div>
-                      <div className="posMid">
-                        <div className="barWrap">
-                          <div className="bar" style={{ width: `${Math.max(2, Math.round(pct * 100))}%` }} />
-                        </div>
-                        <div className="small">{Math.round(pct * 100)}% allocation</div>
-                      </div>
-                      <div className="posRight">
-                        <div className="mono posValue">{v.toFixed(2)}</div>
-                        <div className="small mono">price {Number(p.price ?? 0).toFixed(3)}</div>
-                      </div>
-                    </div>
-                  );
-                })}
-                {positions.length === 0 ? <div className="small">No positions.</div> : null}
-              </div>
-            </div>
-
-            <details>
-              <summary className="pill" style={{ cursor: "pointer", userSelect: "none" }}>
-                Data Points ({datapoints.length})
-              </summary>
-              <pre className="pre" style={{ marginTop: 10 }}>{JSON.stringify(datapoints, null, 2)}</pre>
-            </details>
-          </div>
-        </section>
-
-        {/* Signals */}
-        <section className="card">
-          <div className="cardHeader">
-            <div>
-              <h2>Signals (latest 25)</h2>
-              <div className="hint">Search & click a row to inspect details</div>
-            </div>
-            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
-              <input
-                className="input"
-                placeholder="Search agent/kind/summary…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-              />
-              <select className="select" value={sevFilter} onChange={(e) => setSevFilter(e.target.value)}>
-                <option value="ALL">All severities</option>
-                <option value="INFO">INFO</option>
-                <option value="WARN">WARN</option>
-                <option value="HIGH">HIGH</option>
-                <option value="CRITICAL">CRITICAL</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="chipBar">
-            <button className={`chip ${sevFilter === "HIGH" ? "active" : ""}`} onClick={() => setSevFilter("HIGH")}>High</button>
-            <button className={`chip ${sevFilter === "WARN" ? "active" : ""}`} onClick={() => setSevFilter("WARN")}>Warn</button>
-            <button className={`chip ${riskOnly ? "active" : ""}`} onClick={() => setRiskOnly((v) => !v)}>Risk only</button>
-            <button className={`chip ${tickOnly ? "active" : ""}`} onClick={() => setTickOnly((v) => !v)}>This tick</button>
-            <button
-              className="chip ghost"
-              onClick={() => {
-                setSevFilter("ALL");
-                setRiskOnly(false);
-                setTickOnly(false);
-                setQuery("");
-              }}
-            >
-              Reset
-            </button>
-          </div>
-
-          <div className="table">
-            <div className="thead">
-              <div>Severity</div><div>Agent</div><div>Kind</div><div>Summary</div><div className="alignRight">Time</div>
-            </div>
-
-            {filteredSignals.length ? (
-              filteredSignals.map((s: any, i: number) => (
-                <div
-                  className={`trow sev-${sevClass(s?.severity ?? "INFO")} ${selectedKey === signalKey(s) ? "selected" : ""}`}
-                  key={i}
-                  onClick={() => setSelected(s)}
-                  title="Click to view details"
-                >
-                  <div><span className={`badge ${sevClass(s?.severity ?? "INFO")}`}>{s?.severity ?? "INFO"}</span></div>
-                  <div className="mono ellipsis">{s.agent}</div>
-                  <div className="mono">{s.kind}</div>
-                  <div className="ellipsis" title={s.summary}>{s.summary}</div>
-                  <div className="mono alignRight">{(s.createdAt ?? "").slice(11, 19) || "—"}</div>
-                </div>
-              ))
-            ) : (
-              <div style={{ padding: 12 }} className="small">No signals match your filter.</div>
-            )}
-          </div>
-        </section>
-
-        <div className="footer">
-          <span>API: <span className="mono">/api/state</span> · Audit: <span className="mono">/api/audit?lines=200</span></span>
-          <span className="mono">Tip: click a signal row → details drawer</span>
-        </div>
-      </div>
-
-      {/* Drawer */}
-      {selected ? (
-        <div className="drawerOverlay" onClick={() => setSelected(null)}>
-          <div className="drawer" onClick={(e) => e.stopPropagation()}>
-            <div className="drawerTop">
-              <div className="drawerTitle">
-                <div className="h">Signal Details</div>
-                <div className="s mono">{selected.agent} · {selected.kind} · {(selected.createdAt ?? "").slice(0, 19)}</div>
-              </div>
-              <button className="xbtn" onClick={() => setSelected(null)}>Close</button>
-            </div>
-
-            <div style={{ marginBottom: 10 }}>
-              <span className={`badge ${sevClass(selected.severity ?? "INFO")}`}>{selected.severity ?? "INFO"}</span>
-              <div className="divider" />
-              <div className="rationale">{selected.summary}</div>
-            </div>
-
-            <div className="kv" style={{ marginBottom: 12 }}>
-              <div className="k">Confidence</div>
-              <div className="v mono">{fmtConfidence(selected.confidence)}</div>
-              <div className="k">Risk Score</div>
-              <div className="v mono">{Number.isFinite(selected.riskScore) ? selected.riskScore : "—"}</div>
-              <div className="k">Stance</div>
-              <div className="v mono">{selected.stance ?? "—"}</div>
-            </div>
-
-            {selected.reasons?.length ? (
-              <div className="subsection">
-                <div className="subHeader">
-                  <span className="label">Reasons</span>
-                </div>
-                <ul className="bulletList">
-                  {selected.reasons.map((r: string, i: number) => (
-                    <li key={i}>{r}</li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-
-            {selected.evidence?.length ? (
-              <div className="subsection">
-                <div className="subHeader">
-                  <span className="label">Evidence</span>
-                </div>
-                <ul className="bulletList">
-                  {selected.evidence.map((e: any, i: number) => (
-                    <li key={i}>
-                      <span className="mono">{e.source}</span>
-                      {e.ref ? ` · ${e.ref}` : ""}{e.detail ? ` · ${e.detail}` : ""}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-
-            {selected.constraintsTouched?.length ? (
-              <div className="subsection">
-                <div className="subHeader">
-                  <span className="label">Constraints Touched</span>
-                </div>
-                <ul className="bulletList">
-                  {selected.constraintsTouched.map((c: string, i: number) => (
-                    <li key={i} className="mono">{c}</li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-
-            <details open>
-              <summary className="pill" style={{ cursor: "pointer", userSelect: "none" }}>Raw JSON</summary>
-              <pre className="pre" style={{ marginTop: 10 }}>{JSON.stringify(selected, null, 2)}</pre>
-            </details>
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
+  const selectedScenario = PAPER_SCENARIOS.find((item) => item.id === scenario)!;
+  return <div className="app-shell">
+    <a className="skip-link" href="#main-content">Skip to replay</a>
+    <header className="masthead"><a href="#main-content" className="brand" aria-label="RWA Portfolio Manager"><span className="brand-mark" aria-hidden="true">R<span>\</span></span><span>RWA<span className="brand-divider">/</span><span className="brand-subtitle">Portfolio Manager</span></span></a><span className="paper-label"><span aria-hidden="true" />PAPER EXECUTION</span></header>
+    <main id="main-content">
+      <section className="intro" aria-labelledby="page-heading"><div><div className="eyebrow">Deterministic research environment</div><h1 id="page-heading">Portfolio <em>replay.</em></h1><p>Trace a decision from source data to a reconciled ledger.</p></div><div className="environment-note"><strong>Synthetic data. Real checks.</strong><span>Fixed fixtures · no live funds · no on-chain execution</span></div></section>
+      <section className="scenario-control" aria-label="Scenario controls">
+        <div className="scenario-field"><label htmlFor="scenario">Choose a scenario</label><select id="scenario" value={scenario} onChange={(event) => setScenario(event.target.value as PaperScenarioId)}>{PAPER_SCENARIOS.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></div>
+        <p id="scenario-description">{selectedScenario.description}</p>
+        <button className="run-button" disabled={pending} aria-describedby="scenario-description" onClick={() => void load(scenario)}>{pending ? "Loading replay…" : "Run replay"}<span aria-hidden="true">↗</span></button>
+      </section>
+      <div className="request-status" aria-live="polite" role="status"><span>{pending ? (run ? "Running the selected scenario. Previous result remains below." : "Loading the last completed replay…") : error ? "Replay service unavailable" : run ? `Viewing ${PAPER_SCENARIOS.find((item) => item.id === run.scenario)?.title ?? run.scenario}` : "No replay loaded"}</span>{receivedAt && <span>Last received {receivedAt} · local time</span>}</div>
+      {error && <div className="error-banner" role="alert"><div><strong>Replay request failed</strong><p>{error}{run ? " The previous result below has not been updated." : " Start the local paper API, then retry."}</p></div><button className="secondary-button" disabled={pending} onClick={() => void load()}>Retry connection</button></div>}
+      {run ? <RunResults run={run} /> : <section className="initial-state" aria-busy={pending}><span className="eyebrow">{pending ? "Awaiting evidence" : "No result available"}</span><h2>Risk is <span>UNKNOWN</span></h2><p>A result appears only after the paper service responds. No risk score or execution status has been assumed.</p></section>}
+    </main>
+    <footer><span>RWA Portfolio Manager <span className="separator">/</span> Research prototype</span><span>Paper outcomes are not investment performance.</span></footer>
+  </div>;
 }

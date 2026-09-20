@@ -6,12 +6,30 @@ import { PortfolioPosition, RiskMetric } from "@rpm/shared";
  * - replace with historical returns VaR, stress tests, etc.
  */
 export function computeRiskScore(positions: PortfolioPosition[], signals: { liquidityStress?: number; creditScore?: number } = {}): { score: number; metrics: RiskMetric[] } {
+  if (!positions.length) throw new Error("Risk is unknown: portfolio has no priced positions");
+  for (const p of positions) {
+    const values = [p.quantity, p.price, p.value];
+    if (values.some(v => typeof v !== "string" || !/^-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(v.trim()) || !Number.isFinite(Number(v))) ||
+        Number(p.quantity) < 0 || Number(p.price) <= 0 || Number(p.value) < 0) {
+      throw new Error(`Risk is unknown: invalid position ${p.symbol}`);
+    }
+    const expected = Number(p.quantity) * Number(p.price);
+    if (!Number.isFinite(expected) || Math.abs(expected - Number(p.value)) > Math.max(0.000001, expected * 1e-8)) {
+      throw new Error(`Risk is unknown: inconsistent position value for ${p.symbol}`);
+    }
+  }
   const total = positions.reduce((a, p) => a + Number(p.value), 0);
+  if (!Number.isFinite(total) || total <= 0) throw new Error("Risk is unknown: portfolio value must be positive");
   const sorted = [...positions].sort((a, b) => Number(b.value) - Number(a.value));
   const topShare = total ? Number(sorted[0]?.value ?? 0) / total : 0;
 
-  const liquidity = Math.max(0, Math.min(1, signals.liquidityStress ?? 0));
-  const credit = Math.max(0, Math.min(1, signals.creditScore ?? 0));
+  for (const [name, value] of Object.entries({ liquidityStress: signals.liquidityStress, creditScore: signals.creditScore })) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+      throw new Error(`Risk is unknown: missing or invalid ${name}`);
+    }
+  }
+  const liquidity = signals.liquidityStress!;
+  const credit = signals.creditScore!;
 
   // Proxy metrics for demo (replace with historical VaR/drawdown models)
   const var95 = Math.max(0, Math.min(1, 0.35 * topShare + 0.45 * liquidity + 0.2 * credit));

@@ -6,7 +6,10 @@ export class AuditLog {
   constructor(private path: string) {}
 
   append(obj: unknown) {
-    const line = JSON.stringify({ ts: nowIso(), ...obj });
+    if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+      throw new TypeError("Audit records must be objects");
+    }
+    const line = JSON.stringify({ ...obj, ts: nowIso() });
     fs.appendFileSync(this.path, line + "\n", "utf-8");
   }
 

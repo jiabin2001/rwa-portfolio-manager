@@ -1,0 +1,33 @@
+name: Reproducible pipeline
+on:
+  push:
+    branches: [main, feat/reproducible-paper-pipeline]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run verify
+      - run: npm run replay -- --input artifacts/paper/normal/audit.jsonl --report artifacts/paper/normal/run.json
+      - run: npm -w contracts run demo
+      - run: npm audit --omit=dev --audit-level=high
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: paper-evidence-${{ matrix.os }}
+          path: artifacts/paper/
+          if-no-files-found: error

@@ -1,15 +1,14 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import path from "node:path";
 
 export default defineConfig({
   plugins: [react()],
   server: {
+    host: "127.0.0.1",
+    strictPort: true,
     proxy: {
-      "/api": { target: "http://localhost:3001", changeOrigin: true },
-    },
-    fs: {
-      allow: [path.resolve(__dirname, "../..")],
+      "/api": { target: "http://127.0.0.1:3001", changeOrigin: true },
     },
   },
+  preview: { host: "127.0.0.1" },
 });
